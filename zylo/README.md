@@ -1,218 +1,143 @@
-# Zylo
+# Zylo Dark Pool
 
-**XRP, working on Flare.** Bring XRP across as FXRP, put it to work, and take it back out — from any wallet, with the cross-chain proof step actually completed.
+> A sealed-bid exchange where orders are placed, held and matched without their
+> price, side or size ever becoming public — now built on Midnight with Compact
+> and zero-knowledge proofs.
 
-Built for Flare's *Interoperable Asset Products* bounty. Runs on **Coston2** (chain 114).
+This repository was previously a Flare build (FAssets mint/redeem plus a
+TEE-based confidential order book). It is being rebuilt on **Midnight**: the
+confidentiality that used to depend on trusting an enclave now comes from
+zero-knowledge circuits, and the order book's terms live in private witnesses
+instead of sealed hardware. `DARKPOOL.md` and `PLAN.md` describe the retired
+Flare design and are kept only for reference.
 
----
+This is **Level 1** of the Midnight Builder Challenge: the smallest slice of the
+dark pool that still carries its thesis — a sealed-order commitment contract with
+a public book size, hidden order terms, and a single public clearing price.
 
-## The problem
+## Contract Address
 
-Moving XRP onto Flare is a three-legged process, and most FAsset front-ends only implement two of them:
+| Network | Address |
+|---------|---------|
+| Preview | _not deployed yet_ |
+| Preprod | _not deployed yet_ |
 
-1. **Reserve** collateral from an agent and pay the reservation fee on Flare.
-2. **Pay** the agent in XRP on the XRP Ledger, with a payment reference in the memo.
-3. **Prove** that payment to Flare via the Data Connector, then call `executeMinting`.
+Deployment needs a funded testnet wallet; the address is pasted here after the
+first deploy.
 
-Skip step 3 and nothing arrives. The reservation lapses, the agent keeps the fee, and the user is left watching a spinner. Because the minter is named as executor, no agent bot finishes the job on their behalf — the app has to.
+## What This Does
 
-Zylo implements all three, plus the return trip.
+`contracts/darkpool.compact` is a confidential order primitive with three
+circuits:
 
----
+- **`placeOrder(side, limitPrice, size)`** — the trader commits to an order. The
+  terms are private circuit inputs; only a hiding hash of them reaches the
+  ledger, and a public counter ticks up so the book's *size* is known while its
+  *contents* are not.
+- **`settle(side, limitPrice, size, clearingPrice)`** — the trader re-supplies
+  the order's private terms and proves, in zero knowledge, that they match a live
+  commitment, have not been settled before, and cross the clearing price. Only a
+  nullifier and the clearing price become public.
+- **`lastClearingPrice()`** — reads back the one figure a batch auction is
+  allowed to reveal.
 
-## What it does
+A batch auction on top of this would collect many `placeOrder` commitments,
+choose one uniform `clearingPrice` off-chain, and call `settle` for each crossing
+order — no order ever revealed, only the print.
 
-| Surface | What happens |
-|---|---|
-| **Portfolio** `/dashboard` | Balances across your wallet and smart account, priced live off FTSOv2, with on-chain activity. |
-| **Mint** `/fxrp` | Pick an agent from live on-chain availability, reserve collateral, pay via Xaman QR or deep link, then the app requests a `Payment` attestation from the FDC, waits for the voting round to finalise, and submits `executeMinting` with the Merkle proof. |
-| **Redeem** `/redeem` | Burn FXRP and request XRP back to an XRPL address you control. |
-| **Trade** `/pool` | A confidential orderbook. Orders are signed, sent straight to a Flare Confidential Compute enclave, and matched there in sealed batch auctions — never touching the mempool. Only custody and a Merkle commitment to balances reach the chain. See [DARKPOOL.md](./DARKPOOL.md). |
-| **Earn** `/analytics` | Deposit FLR into an ERC-4626 vault that delegates to FTSO providers and compounds rewards into the yFLR share price. |
-| **Send** `/send` | Move FXRP or FLR out of your account. |
-| **Settings** `/settings` | Wallet, network, active addresses, every contract address in use, and faucet links. |
+## Privacy Model
 
-`/` serves a standalone poster landing page; the app lives behind it.
+**PUBLIC** (on the ledger, anyone can read):
 
-### Two ways to transact
+- `orderCount` — how many sealed orders have ever been placed
+- `orderCommitments` — one hiding hash per order; reveals nothing about its terms
+- `settled` — nullifiers of orders already matched (prevents double-fill)
+- `lastPrint` — the clearing price of the most recent settlement, and the only
+  price this contract ever discloses
 
-Zylo works with **no API keys at all**. Connect MetaMask, Rabby, Coinbase Wallet or any injected wallet and it transacts straight from your EOA.
+**PRIVATE** (circuit inputs and witness, never written in the clear):
 
-Set `NEXT_PUBLIC_ETHERSPOT_API_KEY` and it upgrades: an ERC-4337 smart account with a paymaster sponsors gas, so a new user can complete a mint holding zero FLR. Both paths go through one `useTxSender()` abstraction and return the same receipt shape, so nothing downstream cares which is active.
+- `side`, `limitPrice`, `size` of every order
+- `orderSecret()` — the trader's per-order secret; without it a commitment cannot
+  be reproduced, so it also gates who may settle an order
 
-### Mint sessions survive a refresh
+**PROVED without revealing:**
 
-A reservation is only valid for a limited number of XRPL ledgers. Zylo persists the in-flight mint — reservation id, agent address, payment reference, expiry — keyed by account, shows a live countdown, and resumes at the right step after a reload. It invalidates across tabs via the `storage` event. Closing the tab mid-mint no longer costs the reservation fee.
+- *placeOrder* — "I committed to a well-formed order (`size > 0`, `price > 0`)"
+  without exposing side, price or size.
+- *settle* — "this fill corresponds to a real prior commitment, has not been
+  settled before, and crosses the clearing price" without exposing which order it
+  was or what its terms were.
 
----
+An on-chain observer sees the number of resting orders, a list of opaque hashes,
+a list of spent nullifiers, and the last clearing price. They cannot see any
+order's side, price or size, cannot link an order to a settlement, and cannot
+tell whether two commitments came from the same trader.
 
-## Flare infrastructure used
+## Tech Stack
 
-- **FAssets** — `reserveCollateral`, `executeMinting` and `redeem` against the FXRP AssetManager.
-- **Flare Data Connector** — `Payment` attestations over XRPL transactions; proofs pulled from the DA layer and verified on-chain by the AssetManager.
-- **FTSOv2** — live XRP/USD and FLR/USD feeds for portfolio and TVL pricing.
-- **FTSO delegation** — the vault's yield source.
-- **FlareContractRegistry** — `FdcHub`, `FdcRequestFeeConfigurations` and `FlareSystemsManager` are resolved on-chain rather than pinned in the bundle.
-- **Confidential Compute** — the dark pool's matching engine, order book and balance ledger run inside an enclave; the escrow trusts only its signing key. See the status note below on what is and is not attested today.
+- **Midnight** network (Preview / Preprod testnets)
+- **Compact** language — `pragma language_version 0.26`, compiler `0.34.0`
+- `@midnight-ntwrk/compact-runtime` `0.19.0` for the test harness
+- **Node.js v22**, **Docker** (proof server), **Vitest**
 
----
+## Prerequisites
 
-## Layout
+- Node.js **v22** (`nvm install 22`)
+- Docker Desktop, running
+- The Compact toolchain:
 
-```
-zylo/
-├── flare/          Foundry contracts — ZyloVault (ERC-4626) + FTSOStakingModule
-│                   + ZyloDarkPool (escrow, balance root, emergency exit)
-├── tee/            Go enclave runtime for Flare Confidential Compute —
-│                   sealed order book, batch auction, private ledger
-└── zylofinance/    Next.js 16 app + Capacitor mobile shells
-    ├── app/                landing poster at /
-    ├── app/(app)/          dashboard · fxrp · redeem · pool · analytics · send · settings
-    ├── app/api/            fdc/* · xaman/* · pool/* (proxy to the enclave)
-    ├── app/src/            contracts · services · hooks · components · providers
-    └── tests/              vitest unit tests
-```
+  ```bash
+  curl --proto '=https' --tlsv1.2 -LsSf \
+    https://github.com/midnightntwrk/compact/releases/latest/download/compact-installer.sh | sh
+  compact update
+  compact --version          # expect the dev-tools version
+  compact compile --version  # expect 0.34.0
+  ```
 
-`tee/` is a separate binary by necessity: a Confidential Compute extension is a
-Go HTTP server running inside a CVM, so it cannot live inside the Next.js app.
+- The proof server image (needed for deploy, not for tests):
 
----
+  ```bash
+  docker pull midnightntwrk/proof-server:8.1.0
+  docker run -p 6300:6300 midnightntwrk/proof-server:8.1.0 midnight-proof-server -v
+  ```
 
-## Running it
+## Setup
 
 ```bash
-cd zylofinance
-cp .env.example .env.local
+git clone <this-repo>
+cd zylo
+nvm use 22
 npm install
-npm run dev
+npm run compile        # compact compile -> managed/darkpool/
 ```
 
-Then connect a wallet. Nothing in `.env.local` is required to browse, connect, or read on-chain state.
+`npm run compile` regenerates `managed/darkpool/` — the TypeScript contract, the
+ZK circuits (`placeOrder`, `settle`, `lastClearingPrice`) and their proving and
+verifying keys.
 
-**Contract addresses** are all environment-overridable with working Coston2 defaults — see `.env.example`. Point `NEXT_PUBLIC_ZYLO_VAULT` and friends at your own deployment when you have one; Settings shows exactly what the app is using and flags anything unset.
-
-**To complete a mint** you also need Xaman and FDC credentials:
-
-| Variable | Needed for |
-|---|---|
-| `XUMM_API_KEY` / `XUMM_API_SECRET` | Xaman payment request (server-side) |
-| `FDC_VERIFIER_URL` / `FDC_VERIFIER_API_KEY` | Attestation request (server-side) |
-| `FDC_DA_LAYER_URL` | Merkle proof retrieval (server-side) |
-
-Without them, reserve and pay still work but the final proof step cannot run.
-
-### Commands
+## Run Tests
 
 ```bash
-npm run dev         # dev server
-npm run build       # production build
-npm test            # vitest unit tests
-npm run typecheck   # tsc --noEmit
-npm run lint        # eslint
+npm test
 ```
 
-Contracts:
+12 tests in `tests/darkpool.test.ts`, covering:
 
-```bash
-cd flare
-forge soldeer install
-forge test
-```
+- **circuit logic** — the buy/sell crossing rule, rejection of orders that were
+  never placed, rejection of malformed orders
+- **state transitions** — `orderCount` and `orderCommitments` growth, `lastPrint`
+  moving from `none` to the settled price, and an order being unsettleable twice
+- **privacy** — the ledger exposes only counts, commitments, nullifiers and the
+  print; the raw ledger state contains none of the order's side/price/size; the
+  commitment matches only the exact terms and secret; and a trader who cannot
+  reconstruct an order cannot settle it
 
-**To use the Trade tab** you need the escrow deployed and the enclave running:
+## Initial Idea
 
-```bash
-# 1. deploy the escrow (TEE_SIGNER is the enclave's address)
-cd flare
-TEE_SIGNER=0x... forge script script/DeployZyloDarkPool.s.sol --rpc-url coston2 --broadcast
+_[LEAVE PLACEHOLDER — fill in manually]_
 
-# 2. run the enclave
-cd ../tee
-SIMULATED_TEE=true ENCLAVE_PRIVATE_KEY=0x... DARKPOOL_ADDRESS=0x... go run .
+## Screenshots
 
-# 3. point the app at both
-#    NEXT_PUBLIC_DARK_POOL=0x...   ENCLAVE_URL=http://127.0.0.1:8088
-```
-
-The enclave signer needs its own C2FLR — it pays gas for `publishRoot` and
-`withdraw`. Without `NEXT_PUBLIC_DARK_POOL` the Trade tab says so and stays
-inert rather than erroring.
-
-```bash
-cd tee
-go test ./...      # enclave: matching, ledger, fail-closed withdrawals
-go run . 2>&1      # start the runtime
-```
-
-Mobile shells: see [HOW_TO_RUN_MOBILE.md](./zylofinance/HOW_TO_RUN_MOBILE.md).
-
----
-
-## Tests
-
-58 unit tests covering the logic that would silently corrupt a mint if it broke:
-
-- **Mint sessions** — persistence, per-account keying, in-place updates, history cap, active-session selection, corrupt-storage recovery, snapshot reference stability for `useSyncExternalStore`, cross-tab invalidation.
-- **Expiry** — countdown maths, lapsed-reservation detection, unbounded deadlines, formatting.
-- **Call encoding** — every contract call decoded back and asserted, including that value rides on `depositFLR` and `reserveCollateral` and not elsewhere.
-- **Event parsing** — `CollateralReserved` decoded from synthetic logs, nested receipt shapes, foreign-contract logs skipped, readable failures.
-- **Error surfacing** — paymaster and AA codes translated to something a user can act on.
-- **Trail geometry** — the landing page's blob renderer.
-
-- **Market ids** — pinned against the enclave's Go derivation, because a mismatch would silently reject every order as an unknown market rather than failing loudly.
-
-Plus **30 Foundry tests** (6 on `ZyloVault`, 19 on `ZyloDarkPool` custody and its
-adversarial cases, 5 cross-language conformance) and **17 Go tests** on the
-enclave — batch clearing, value conservation, collateral double-spend, replayed
-deposits, fail-closed withdrawals.
-
-### Cross-language conformance
-
-The enclave and the escrow independently implement the same leaf encoding and
-EIP-712 hashing, in two languages; the frontend derives market ids in a third.
-A divergence in the first pair would only surface when a user tried to exit an
-enclave that had gone dark — the worst possible moment — so agreement is
-asserted rather than assumed:
-
-```bash
-cd tee && go test -run CrossCheck ./...        # emits the vector
-cd ../flare && forge test --match-contract CrossCheck
-cd ../zylofinance && npm test -- markets
-```
-
----
-
-## Honest status
-
-- Coston2 testnet only. Nothing is deployed to Flare mainnet.
-- **Not audited.** Do not put real value in it.
-- **The dark pool is not running on Confidential Compute hardware yet.** It runs
-  today with `SIMULATED_TEE=true`, which generates or loads an ordinary key on
-  an ordinary machine. The architecture is built for FCC — a Go HTTP server with
-  persistent in-enclave state and outbound network access — and the escrow's
-  trust model is written around an enclave key it cannot forge. But there is **no
-  CVM and no remote attestation in the current deployment**, so the privacy
-  guarantee presently rests on trusting whoever runs the process, not on
-  hardware. Moving to a real CVM and having governance register the signer only
-  against a verified attestation quote is the remaining step, and it is the
-  difference between "confidential by design" and "confidential in fact".
-- The enclave is driven by directly signed EIP-712 intents rather than through
-  `TeeExtensionRegistry`'s on-chain instruction model. That is a deliberate
-  trade — it keeps order placement off-chain, which is the point — but it means
-  this is not a drop-in FCC extension.
-- The operator can censor an order. Users cannot force inclusion; they can only
-  exit against the last published balance root. That is the honest weak point of
-  the design.
-- The FDC attestation path — verifier payload shapes, voting-round bracketing, the `IPayment.Proof` tuple — is ported from `script/fassets/FAssetsExecuteMinting.s.sol` but **has not yet been run end to end against a live round.** That is the highest-risk area and the next thing to validate.
-- Redemption is likewise implemented but unexercised on-chain.
-- Mint sessions are per-device. Clearing site data mid-mint loses the resume state, though the reservation still exists on-chain.
-- Yield is reported as realised rewards and share price. There is deliberately no projected APY, because the contract cannot yet back one up with history.
-- The landing poster ships with its two display faces unembedded and falls back to Arial/Times.
-
-## Beyond the hackathon
-
-1. Run one real mint on Coston2 end to end — it validates the verifier, the DA layer, round bracketing and the proof ABI in a single pass.
-2. Deploy the enclave to a real Confidential Compute CVM and gate `rotateTeeSigner` on a verified attestation quote. Until that lands, the dark pool's confidentiality is a design property rather than a hardware one.
-3. Mainnet FXRP behind a feature flag, using the same registry-driven addressing.
-4. A TEE-based executor so `executeMinting` completes even if the user closes the tab — the same enclave already holds a key and could be named as `executor` in `reserveCollateral`.
-5. FXRP as vault collateral, so bridged XRP earns instead of sitting idle.
+_[LEAVE PLACEHOLDER — add `compact compile` output and the deployed contract
+address]_
