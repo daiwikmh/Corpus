@@ -1,185 +1,229 @@
-# Road to First Mint — Zylo build plan
+# Road through the Midnight Builder Challenge — Zylo Dark Pool
 
-**Everything hinges on one completed mint.**
+**One contract, six levels, New Moon to Supermoon.** Each level adds one real
+capability to the dark pool and retires a specific unknown. The contract is the
+spine; the frontend, the batch operator and custody hang off it in that order.
 
-The app is built, tested, and confirmed reading live Coston2 data. It has never written to the chain. This plan front-loads the riskiest write path, because a single successful mint either validates or breaks the four most uncertain pieces at once.
-
-| Unit tests | Contract tests | Routes | Transactions sent |
+| Circuits | Contract tests | Frontend | Transactions sent |
 |---|---|---|---|
-| 49 passing | 6 passing | 8 + 4 API | **0, ever** |
+| 3 (`placeOrder`, `settle`, `lastClearingPrice`) | 12 passing | none yet | **0, ever** |
 
 ---
 
-## 00 — Confirmed working
+## L1 · New Moon — Setup & First Contract — *done*
 
-Verified by driving a real browser against a production build, not by inspection. Everything below reads live from Coston2.
+Verified, not asserted. `npm run compile` emits three circuits into
+`managed/darkpool/`; `npm test` runs 12 tests green.
 
-| Capability | Evidence |
+| Requirement | Evidence |
 |---|---|
-| FTSOv2 price feeds | XRP $1.01, FLR $0.00601 rendered on the portfolio |
-| FAssets agent discovery | 4 live agents — 506 / 950 / 150 / 98 free lots, 0.25% fee |
-| Collateral fee quote | `collateralReservationFee` returned 1.676255 C2FLR |
-| Vault reads | TVL, share price and rewards render on Earn |
-| Lot size | Redeem shows 1 lot = 10.00 XRP |
-| All six tabs | Portfolio · Mint · Redeem · Earn · Send · Settings |
-| Landing | Wordmark, nav panels, CTA, 0 console errors |
-| Wallet connect | Injected · MetaMask · Coinbase · read-only demo |
+| Compiles with `compact compile` | `managed/darkpool/{contract,zkir,keys}` regenerated on demand |
+| `managed/` present | committed |
+| 3+ tests passing | 12 — crossing rule, malformed/phantom rejection, `orderCount`/`orderCommitments`/`lastPrint`/`settled` transitions, no-double-settle, 4 privacy assertions |
+| Public ledger state | `orderCount`, `orderCommitments`, `settled`, `lastPrint` |
+| Private witness as input | `orderSecret()`; plus `side`/`limitPrice`/`size` as private circuit inputs |
+| Deliberate `disclose()` | 4×, each annotated — every one is a hash or the agreed clearing price |
+| README with all sections | `README.md` |
+
+**Not done in L1:** deploy. It needs a funded testnet wallet and the proof
+server, and is the first task of L2.
 
 ---
 
-## 01 — Prove the write path
+## L2 · Waxing Crescent — Frontend Integration
 
-Strictly sequential. Each step is a prerequisite for the next, and each one retires a specific unknown. **Do not reorder to do the easy parts first.**
+Strictly sequential. Each step is a prerequisite for the next.
 
-### 1.1 Fund a wallet on Coston2 — *start here*
+### 2.1 Deploy the contract — *start here*
 
-Nothing else can run until an address holds C2FLR.
+Nothing else can run until `darkpool.compact` is on Preprod.
 
-Connect MetaMask, let Zylo add the network, then use the faucet linked in Settings. You need roughly 5 C2FLR to cover a reservation fee plus gas.
+Stand up a Node deploy script using `@midnight-ntwrk/midnight-js-contracts` with
+the four providers (indexer, node, proof server, wallet). Fund a wallet with
+tDUST from the faucet, run the local proof server, deploy.
 
-- **Verify:** Portfolio shows a non-zero C2FLR balance.
+- **Verify:** a contract address prints; `lastClearingPrice()` reads back
+  `{ is_some: false }` from a fresh deployment.
+- **If it fails:** proof-server URL and the ZK config provider path are the usual
+  culprits — confirm `managed/darkpool/keys/*` are the ones the deployed verifier
+  expects.
 
-### 1.2 Deposit into the vault — *pending*
+### 2.2 Wallet connect
 
-The simplest possible write. Proves the whole transaction layer before any FAssets complexity is involved.
+`WalletConnect.tsx` — connect and disconnect Lace via
+`@midnight-ntwrk/dapp-connector-api`. Show the address when connected, a clear
+disconnected state otherwise. Handle: wallet absent, user rejected, wrong
+network.
 
-Exercises `useTxSender`'s wallet branch, `walletClient.sendTransaction`, and receipt normalisation from viem's shape into `UserOpReceipt`.
+- **Verify:** address appears on connect, clears on disconnect.
 
-- **Files:** `hooks/useTxSender.ts`, `components/vault/VaultCard.tsx`
-- **Verify:** yFLR balance appears; withdraw returns the FLR.
-- **If it fails:** Receipt normalisation is the likely culprit — check the `status === 'success'` mapping.
+### 2.3 Place an order from the browser
 
-### 1.3 Reserve collateral — *unverified ABI*
+`CircuitCall.tsx` — a form for side / limit price / size that calls `placeOrder`.
+The three terms are collected, passed straight into the circuit, and **never
+rendered back, logged, or put in the URL**. The proof is generated locally.
 
-First FAssets write, and the first test of a hand-written event decoder.
+`orderSecret()` is supplied by the dapp's private-state provider — a fresh random
+32 bytes per order, stored locally keyed by wallet address, because nothing
+on-chain identifies an order as yours.
 
-The `CollateralReserved` ABI was written by hand from the Foundry example. If any field ordering is wrong, decoding throws and the mint dies before the XRP leg. Unit tests cover the decoder against synthetic logs, but never against a real one.
+- **Verify:** after submit, `orderCount` increments and the new commitment is a
+  member of `orderCommitments`; the UI shows "proved without revealing your
+  order" and none of the three terms.
+- **Watch:** the private-state store is the resting-order book from the user's
+  side. Lose it and the order can be seen to exist but never settled.
 
-- **Files:** `contracts/abis.ts`, `utils/etherspot.ts`, `components/mint/ReserveStep.tsx`
-- **Verify:** Pay step opens with an r-address, memo hex and a live countdown.
-- **If it fails:** Compare the decoded struct against the raw log in the explorer, field by field.
+### 2.4 Resting orders view
 
-### 1.4 Pay the agent in XRP — *needs keys*
+List the caller's own orders from the local private-state store, each marked
+*resting* or *settled* by checking `settled.member(nullifier)` against the chain.
 
-Cross-chain leg. Requires Xaman credentials the repo does not have.
+- **Verify:** an order placed in 2.3 shows as resting; nothing that isn't the
+  caller's appears.
 
-Set `XUMM_API_KEY` and `XUMM_API_SECRET`, get testnet XRP, then scan the QR. The manual-hash input is the fallback if Xaman misbehaves — pay from any XRPL wallet with the memo set to Hex, and paste the transaction hash.
+### 2.5 Deploy the frontend
 
-- **Files:** `api/xaman/payload`, `api/xaman/status/[uuid]`, `components/mint/PayStep.tsx`
-- **Verify:** Status polling flips the session to `paid` and stores the XRPL hash.
-- **Watch:** Send the exact amount before the countdown expires or the fee is forfeit.
+`vercel.json` or `netlify.toml`, exact CLI commands in the README. The live URL
+points at the Preprod contract.
 
-### 1.5 Complete the mint through the FDC — *highest risk*
+- **Verify:** the deployed site connects Lace and places an order end to end.
 
-The step every other FAsset front-end skips, and the one thing that makes this project worth submitting.
+**L2 risks**
 
-Four unknowns fire at once: the verifier's request and response shapes, the DA layer's endpoint contract, the voting-round bracketing, and the hand-built `IPayment.Proof` tuple. Any single mismatch reverts `executeMinting`.
-
-- **Files:** `services/fdcService.ts`, `api/fdc/prepare`, `api/fdc/proof`, `contracts/abis.ts`
-- **Env:** `FDC_VERIFIER_URL`, `FDC_VERIFIER_API_KEY`, `FDC_DA_LAYER_URL`
-- **Verify:** FXRP lands in the account; session flips to `minted`.
-- **De-risk first:** Hit the verifier and DA layer with curl before wiring the UI — isolates payload bugs from contract bugs.
-
-### 1.6 Redeem back to XRP — *unverified signature*
-
-Closes the round trip, which is the product's actual thesis.
-
-`redeem` is encoded as payable with an executor argument, and `RedemptionRequested` is parsed best-effort. A signature mismatch reverts; an event mismatch degrades gracefully to a generic success screen.
-
-- **Files:** `components/redeem/RedeemCard.tsx`, `utils/etherspot.ts`
-- **Verify:** FXRP burns; XRP arrives at the destination on the XRPL.
-
----
-
-## 02 — Harden what phase 1 breaks
-
-Do not write this code speculatively. Wait for the real failures, then fix exactly those.
-
-### 2.1 Correct the ABIs against reality
-
-Fix whatever field ordering or signature the live calls disprove, then add a regression test with the real log bytes so it can never silently break again.
-
-- **Verify:** New test in `tests/calls.test.ts` using captured real-shaped data.
-
-### 2.2 Handle the FDC timeout honestly
-
-Voting rounds take roughly 90 seconds and proofs land shortly after. If polling regularly outlives the tab, move proof retrieval behind a resumable job rather than a blocking loop.
-
-- **Files:** `services/fdcService.ts`
-
-### 2.3 Turn on sponsored gas — *optional*
-
-Set `NEXT_PUBLIC_ETHERSPOT_API_KEY` and re-run the whole of phase 1 through the smart-account branch. Both paths share one interface, but only the wallet branch will have been exercised.
-
-- **Verify:** A zero-balance account completes a mint end to end.
+- **Browser proof generation.** `placeOrder`'s circuit is small, but proof time
+  and WASM/proof-server wiring in the browser is the first real unknown. De-risk
+  by proving `placeOrder` from a Node script before touching React.
+- **Private state is per-device.** Same failure mode as any local key store —
+  clearing site data orphans orders. Say so in the UI.
 
 ---
 
-## 03 — Submission readiness
+## L3 · First Quarter — Production-Grade dApp
 
-### 3.1 Deploy the vault and fill in the addresses — *deferred by choice*
+### 3.1 Tests — hold the line at 12+
 
-Every address already resolves through env with a Coston2 default, and Settings flags anything unset. Deploy when ready and populate the vars — **no code changes required**.
+Keep the three categories green (circuit logic, state transitions, privacy). Add
+a test for any bug L2 surfaces, with the real shape that broke it.
 
-- **Command:** `forge script script/DeployZylo.s.sol --broadcast`
-- **Env:** `NEXT_PUBLIC_ZYLO_VAULT`, `NEXT_PUBLIC_ASSET_MANAGER`, `NEXT_PUBLIC_FXRP`
+### 3.2 CI/CD — `.github/workflows/ci.yml`
 
-### 3.2 Embed the display faces — *cosmetic*
+On push to `main` and on PR: checkout → Node 22 → install the Compact toolchain
+(`compact-installer.sh` + `compact update`) → `npm run compile` → `npm test`.
+Cache the toolchain download. CI badge at the top of the README.
 
-The landing ships with two commented `@font-face` blocks and falls back to Arial and Times. Paste the base64 payloads into the marked slots.
+- **Verify:** a green run on a pushed branch; badge renders.
 
-- **Files:** `components/landing/orbit.css.ts`
+### 3.3 Polish
 
-### 3.3 Record the demo — *required*
+Every error state has a user-facing message. A spinner during proof generation.
+Privacy behaviour labelled in the UI, not buried. Mobile-responsive. `npm run
+build` with zero console errors.
 
-Lead with the proof step — that is the differentiator. Show the countdown, the FDC stages, and FXRP arriving. Open on the read-only demo so judges can click through without a wallet.
+### 3.4 `PROPOSAL.md`
 
-### 3.4 Update the README status section — *required*
-
-It currently states plainly that the FDC leg is unexercised. The moment a real mint completes, that line must change — and it must stay accurate if it does not.
-
-- **Files:** `README.md`
-
----
-
-## 04 — Open risks
-
-**The FDC path may need several correction rounds.** Four independent contracts are inferred from a Foundry script. Budget more than one attempt, and validate the verifier and DA layer with curl before blaming the contract call.
-
-**Reservation fees are spent on every failed attempt.** 1.676 C2FLR per reservation, non-refundable once it lapses. Debug the FDC leg against an existing reservation rather than starting a fresh mint each time.
-
-**Agent availability moves.** Free lots are read live and Coston2 agents get restocked irregularly. An empty agent list is a testnet condition, not a bug — the UI already says so.
-
-**Mint sessions are per-device.** Stored in localStorage, invalidated across tabs. Clearing site data mid-mint loses the resume state, though the reservation still exists on-chain and the fee is still at stake.
-
-**Mobile shells are untested.** The Capacitor iOS and Android projects are present but have not been built or run since the wallet migration. Treat mobile as unshipped.
+Product, users, why Midnight specifically (a private limit price is impossible on
+a transparent chain), the data model table (public ledger vs private witness),
+and whether Mainnet by L6 is realistic. Placeholders for the answers — that is
+the product argument and is written by hand.
 
 ---
 
-## 05 — Environment reference
+## L4 · Waxing Gibbous — MVP Goes Live
 
-Nothing is required to browse, connect or read. Requirements begin at the write path.
+Only after the proposal is approved.
 
-| Variable | Needed for | Without it |
-|---|---|---|
-| `NEXT_PUBLIC_DEMO_ADDRESS` | Read-only demo entry | Button hidden |
-| `NEXT_PUBLIC_ETHERSPOT_API_KEY` | Sponsored gas | Wallet pays its own gas |
-| `NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID` | WalletConnect option | Connector hidden |
-| `XUMM_API_KEY` / `XUMM_API_SECRET` | Xaman payment request | Manual XRPL payment only |
-| `FDC_VERIFIER_URL` / `FDC_VERIFIER_API_KEY` | Payment attestation | **Mint cannot complete** |
-| `FDC_DA_LAYER_URL` | Merkle proof retrieval | **Mint cannot complete** |
-| `NEXT_PUBLIC_ZYLO_VAULT` et al. | Pointing at your deployment | Coston2 defaults used |
+### 4.1 The batch operator
+
+The missing half of the venue: an off-chain service that watches
+`orderCommitments`, closes a batch on a cadence, picks one clearing price, and
+calls `settle` for each crossing order.
+
+It never learns an order's terms — traders submit their private terms to it over
+an authenticated channel only at settlement, or the operator is handed
+pre-built `settle` proofs. Decide which at design time; the second keeps terms on
+the trader's machine entirely.
+
+- **Verify:** two crossing orders placed independently both settle in one batch
+  at the same `lastPrint`; a non-crossing order is left resting.
+
+### 4.2 Clearing-price honesty
+
+Add an in-circuit bound: the clearing price must lie between the best resting bid
+and ask the batch includes. Removes the operator's "legal but unfavourable price"
+lever. New tests for the bound.
+
+### 4.3 Custody — settle moves value
+
+Extend `settle` to debit and credit shielded token balances (Zswap) so a fill is
+a transfer, not just a proof of a match. This is the largest single addition and
+may warrant its own contract module.
+
+- **Verify:** balances change by exactly the fill; value is conserved across a
+  batch; a replayed `settle` still reverts.
+
+### 4.4 `docs/USAGE.md`
+
+Plain-English: what you need, step-by-step, what gets proved and what stays
+private, troubleshooting.
+
+### 4.5 Redeploy to Preprod, update every address
+
+Contract address into the README table (mandatory), frontend re-pointed, codebase
+swept for stale addresses.
 
 ---
 
-## Deferred: Flare Confidential Compute
+## L5 · Full Moon — Users & Feedback
 
-Researched and scoped, **no code written**. An FCC extension is a Go HTTP server in a confidential VM, driven by on-chain instructions through `TeeExtensionRegistry`, with outbound network access and persistent in-enclave state. `SIMULATED_TEE=true` allows development without CVM hardware.
+- `USERS.md` — 50 verified Preprod wallet addresses, filled as they arrive.
+- `docs/FEEDBACK.md` — collection method, raw log, themes, what changed.
+- Acquisition copy — Discord/Telegram, X, a DM template.
+- Iterate: implement the top 2–3 improvements, record them in `FEEDBACK.md`,
+  update the README if behaviour changed.
 
-The natural fit for this codebase is a **TEE mint executor**: the extension holds its own key, gets named as `executor` in `reserveCollateral` — a first-class FAssets parameter that already pays an executor fee — and completes step 1.5 on the user's behalf. Because FCC has no scheduler, it would need staging into two instructions rather than running as a background watcher.
-
-Treat this as a separate project. It does not block anything above.
+The 50 users and the feedback itself are collected by hand.
 
 ---
 
-*Zylo runs on Coston2 testnet and is unaudited. Status reflects the repository as verified in a live browser session against a production build.*
+## L6 · Supermoon — Launch
+
+- Implement the top feedback items; `docs/FEEDBACK.md` gets an `L6 Improvements`
+  section.
+- Redeploy to Preprod with the updated contract; update the address everywhere.
+- `docs/USAGE.md` final pass — "Getting Started on Preprod", "Your First
+  Transaction".
+- `LAUNCH_USERS.md` — 20 onboarded wallet addresses.
+- Brand brief (tagline, three messages, palette, X bio), onboarding script, final
+  README with every section, demo video showing the contract address, the full
+  place→settle flow, and the privacy model end to end.
+- Mainnet behind a flag if 4.3 custody is solid and audited-enough to say so.
+
+---
+
+## Open risks
+
+**Deploy tooling is unbuilt.** The whole midnight-js provider stack (indexer,
+node, proof server, wallet) has to be wired before anything writes to a testnet.
+Budget L2.1 generously and validate each provider independently.
+
+**The batch operator is a trust surface, not a convenience.** It can censor and,
+until 4.2 lands, it can pick a bad price. The design in 4.1 decides how much it
+ever sees; get that right before building it.
+
+**Custody (4.3) is the hard part.** Matching orders privately is done. Moving
+value privately, conserving it across a batch, and keeping the replay guards
+intact is a second project inside this one.
+
+**Private state is the resting-order book.** There is no on-chain "my orders"
+query by design. The local store's persistence and portability across devices is
+a real product problem, not an afterthought.
+
+**Proof generation in the browser is unproven here.** Circuit sizes are small
+today but grow with 4.2 and 4.3. Measure proof time at every level, not just at
+the end.
+
+---
+
+*Zylo runs on Midnight Preview / Preprod testnets and is unaudited. Status
+reflects the repository as verified: `npm run compile` and `npm test` green, zero
+transactions sent.*

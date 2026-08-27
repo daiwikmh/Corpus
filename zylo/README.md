@@ -4,16 +4,15 @@
 > price, side or size ever becoming public — now built on Midnight with Compact
 > and zero-knowledge proofs.
 
-This repository was previously a Flare build (FAssets mint/redeem plus a
-TEE-based confidential order book). It is being rebuilt on **Midnight**: the
-confidentiality that used to depend on trusting an enclave now comes from
-zero-knowledge circuits, and the order book's terms live in private witnesses
-instead of sealed hardware. `DARKPOOL.md` and `PLAN.md` describe the retired
-Flare design and are kept only for reference.
+Confidentiality comes from zero-knowledge circuits: the order book's terms live
+in private witnesses, and the ledger holds only hiding commitments, spent
+nullifiers, a count, and one clearing price.
 
 This is **Level 1** of the Midnight Builder Challenge: the smallest slice of the
 dark pool that still carries its thesis — a sealed-order commitment contract with
-a public book size, hidden order terms, and a single public clearing price.
+a public book size, hidden order terms, and a single public clearing price. The
+design is in `DARKPOOL.md`; the roadmap through the remaining levels is in
+`PLAN.md`.
 
 ## Contract Address
 

@@ -1,47 +1,55 @@
-# Zylo Dark Pool — confidential matching on Flare
+# Zylo Dark Pool — confidential matching on Midnight
 
-A sealed-bid FXRP/C2FLR exchange whose order book lives inside a Flare
-Confidential Compute enclave. Orders are never public, matching happens off the
-mempool entirely, and the chain sees only custody and a commitment.
+A sealed-bid exchange whose order terms live in zero-knowledge circuits instead
+of public state. Orders are placed as hiding commitments, matched against a
+single clearing price, and settled with a proof — the chain never sees a side, a
+limit price or a size.
 
-Built for the Flare Confidential Compute bounty. Runs on Coston2.
+Built on **Midnight** with **Compact**. Runs on the Preview / Preprod testnets.
 
 ---
 
-## What runs privately inside the TEE
+## What stays private
 
-Everything that would leak trading intent:
+Everything that would leak trading intent is a private circuit input or a
+witness, never a ledger cell:
 
-| Held in the enclave | Why it cannot be on-chain |
+| Private | Why it cannot be on-chain |
 |---|---|
-| Every resting order — account, side, limit price, size | A limit price on-chain is a free option for anyone watching |
-| The full book, both sides | Visible depth is what makes size costly to trade |
-| Per-account balances and locked collateral | Position sizes identify participants across trades |
-| The matching itself | Ordering is only fair if nobody can observe it first |
-| Fills, and who traded against whom | Counterparty leakage is most of the information |
+| Every order's side, limit price and size | A limit price on-chain is a free option for anyone watching |
+| The link between an order and its settlement | Counterparty leakage is most of the information |
+| The link between two orders from the same trader | `orderSecret()` is mixed into every commitment, so equal traders do not produce relatable hashes |
+| Per-account balances and locked collateral *(later level)* | Position sizes identify participants across trades |
 
-The enclave holds a signing key sealed to the CVM. That key is the only thing
-the escrow contract trusts, and it never leaves the hardware.
+`orderSecret()` is a Compact `witness` — supplied by the trader's local state,
+pulled into the circuit, and never disclosed. Without it a commitment cannot be
+reproduced, so it doubles as the authority to settle an order.
 
-## What is verified and consumed on-chain
+## What reaches the ledger
 
-Three things, and nothing else:
+Four things, and nothing else:
 
-1. **Deposits.** `ZyloDarkPool.deposit` / `depositNative` take custody. The
-   enclave watches `Deposited` and credits its internal ledger, keyed on the
-   transaction hash so a reorg or a replayed log cannot credit twice.
+1. **`orderCount`** — a public `Counter`. The book's *size* is known; its
+   *contents* are not.
 
-2. **A balance commitment.** Every batch, the enclave publishes a Merkle root
-   over `(account, token, amount)` via `publishRoot`, signed EIP-712 with the
-   enclave key and carrying a strictly increasing epoch. This is the *entire*
-   on-chain footprint of the book: no order, no fill, no counterparty, no price
-   beyond the clearing print.
+2. **`orderCommitments`** — a `Set<Bytes<32>>` of hiding hashes, one per order.
+   `commitment = persistentHash([tag, orderSecret(), persistentHash([side, price, size])])`.
+   Binding (any change of terms changes the hash) and hiding (the 32-byte secret
+   is mixed in before hashing).
 
-3. **Withdrawals.** The enclave signs a `Withdrawal` voucher; the contract
-   recovers it against the registered signer and pays out. Nonces are
-   single-use and vouchers carry a deadline.
+3. **`settled`** — a `Set<Bytes<32>>` of nullifiers, one per matched order.
+   `nullifier = persistentHash([tag, commitment])`. Publishing it is what stops
+   an order being filled twice; it reveals nothing about the order.
 
-## Why this needs confidential compute
+4. **`lastPrint`** — a `Maybe<Uint<64>>`, the clearing price of the most recent
+   settlement. This is the *only* price the contract ever discloses.
+
+Every write derived from private data goes through `disclose()` explicitly — the
+compiler refuses otherwise — and each `disclose()` in `contracts/darkpool.compact`
+is annotated with why the disclosed value is safe (it is a hash, or it is the
+agreed clearing price).
+
+## Why zero knowledge, not a plain contract
 
 A normal smart-contract order book cannot keep a limit price secret. State is
 public and the mempool is public, so:
@@ -50,20 +58,20 @@ public and the mempool is public, so:
 - Any match that touches the mempool can be front-run or sandwiched.
 - Commit–reveal hides price only until reveal, and reveal is where execution
   happens, so the leak just moves.
-- ZK proves a matching was done correctly but does not give you a *private
-  book with shared state* — participants still have to reveal to someone.
 
-The TEE gives the one thing missing: a place where mutually distrusting orders
-can sit together, be compared, and be matched, without any of them becoming
-visible — while still producing an output a contract can act on.
+Midnight's model closes this: a circuit input is a *private witness*, proven in
+zero knowledge and never written down. `placeOrder` proves "I committed to a
+well-formed order" without the terms; `settle` proves "this fill matches a live
+commitment, has not been settled before, and crosses the clearing price" without
+saying which order it was. The proof is generated on the trader's machine by the
+local proof server; the network verifies it against the circuit's verifying key.
 
-**Batch auctions, not a continuous book.** Every order resting when the batch
-closes is treated as arriving at the same instant. A single clearing price is
-chosen to maximise executed volume, and every crossing order settles at that
-price — buyers who bid above it are refunded the difference rather than paying
-their limit. This removes latency advantage *inside* the enclave too, so
-neither a user nor the operator can profit from ordering. That is a deliberate
-narrowing of what the operator could otherwise extract.
+**Batch auctions, not a continuous book.** Orders resting when a batch closes are
+treated as arriving at the same instant. One clearing price is chosen off-chain
+to maximise executed volume, and every crossing order settles at that price. The
+circuit does not pick the price — it only proves each fill is consistent with it
+— so the batch operator's single lever is *which* price to publish. That is the
+residual trust and is stated below.
 
 ## Trust assumptions
 
@@ -71,166 +79,117 @@ Stated plainly, including what is not covered.
 
 **What you must trust**
 
-- The CVM's attestation and isolation. If the hardware is broken, the book is
-  readable and matching can be biased.
-- That the enclave runs the audited binary. Attestation covers the measurement;
-  reproducing the build is on the operator.
+- The soundness of Midnight's proof system and the correctness of the Compact
+  compiler. A broken proof would let a non-crossing order settle, or a
+  fabricated commitment be "matched".
+- The batch operator's choice of clearing price. The circuit proves each fill
+  crosses the published price; it does not yet prove the price maximises volume
+  or falls between the best bid and ask. A dishonest operator can pick a price
+  that is legal but unfavourable.
 
 **What you do not have to trust**
 
-- *Custody.* The escrow contract only ever pays `account` — the address named
-  in the voucher. A malicious enclave signing itself a voucher moves funds to
-  the user in that voucher, not to itself. This is asserted directly in
-  `test_enclaveCannotRedirectFundsToItself`.
-- *Liveness.* If the enclave stops publishing roots for
-  `rootStalenessWindow`, anyone may exit unilaterally via `emergencyWithdraw`,
-  proving their balance against the last published root. The operator cannot
-  freeze funds by going dark.
-- *Withdrawal integrity.* The runtime is fail-closed: a balance is moved out of
-  the spendable pool, the escrow call is awaited, and only a receipt with
-  status 1 retires it. A reverted or dropped transaction restores the balance
-  rather than burning it (`TestWithdrawalIsFailClosed`).
-- *Account privacy from other users.* Reads are gated behind short-lived
-  EIP-712 session signatures, so balances and orders are not an open API.
+- *Confidentiality of order terms.* Side, price and size are private witnesses.
+  They are not on the ledger, not in the transaction, and not recoverable from
+  the commitment without the exact terms and the trader's secret. Asserted in
+  `tests/darkpool.test.ts` — the raw ledger state is scanned and contains none of
+  the order's values, and the commitment matches only the exact `(secret, side,
+  price, size)` tuple.
+- *No double-fill.* A nullifier is published on settlement and checked on the
+  next; a second `settle` of the same order reverts. Asserted directly.
+- *No settlement of a phantom order.* `settle` reconstructs the commitment from
+  the supplied terms and requires it to be a member of `orderCommitments`;
+  terms that were never placed revert with `no such sealed order`.
+- *Authority.* Only a party holding the order's `orderSecret()` can reconstruct
+  its commitment, so only they can settle it. A different secret produces a
+  different hash and fails the membership check.
 
 **What is genuinely not covered**
 
-- **Censorship.** The operator can refuse to include an order. Users cannot
-  force inclusion; they can only exit. This is the honest weak point.
-- **Root withholding within the window.** A root can be stale by up to
-  `rootStalenessWindow` before exit unlocks, so an exit may settle against a
-  slightly old balance. Shortening the window trades this against gas.
-- **`SIMULATED_TEE=true` provides no security.** It exists so the exchange can
-  be developed and demonstrated without CVM hardware. It is not a trust
-  equivalent, and the runtime logs a warning on every start.
+- **Censorship.** The batch operator can decline to settle an order. A trader
+  cannot force a fill; placement, however, is a direct ledger transaction the
+  operator cannot block.
+- **Clearing-price honesty.** As above — bounding the price to `[bestBid,
+  bestAsk]` or proving volume maximisation in-circuit is future work.
+- **Balances and custody.** This contract matches orders; it does not yet hold or
+  move assets. Settlement against shielded token balances (Zswap) is a later
+  level. Until then "settle" proves a match, not a transfer.
+- **Timing / size correlation.** Commitments are published as they arrive. An
+  observer counting `orderCount` between blocks learns how many orders were
+  placed and when, though not by whom or for what.
 
 ## Architecture
 
 ```
-  user wallet                    enclave (FCC CVM)              Coston2
-  ───────────                    ─────────────────              ───────
-  deposit ─────────────────────────────────────────────────▶ ZyloDarkPool
-                                 watch Deposited ◀──────────── (custody)
-  EIP-712 signed order ────────▶ verify signature
-                                 lock collateral
-                                 order rests, sealed
-                                       │
-                                 batch closes
-                                 uniform-price auction
-                                 settle internally
-                                       │
-                                 Merkle root ───────────────▶ publishRoot
-  EIP-712 withdraw ────────────▶ debit, sign voucher ───────▶ withdraw
-                                 await receipt ◀────────────── payout
-                                 confirm or restore
+  trader (browser + local proof server)            Midnight ledger
+  ────────────────────────────────────             ───────────────
+  side / price / size  ── private witness ──┐
+  orderSecret()        ── witness ──────────┤
+                                            ▼
+                              build commitment in-circuit
+                              prove placeOrder ───────────▶ orderCommitments.insert(hash)
+                                                           orderCount += 1
+        (batch closes; operator picks one clearing price off-chain)
 
-  enclave silent > window:
-  user ────────────────────────────────────────────────────▶ emergencyWithdraw
-                                                              (Merkle proof)
+  re-supply the same private terms ─────────┐
+                                            ▼
+                    prove: commitment ∈ orderCommitments
+                           nullifier ∉ settled
+                           order crosses clearingPrice
+                    prove settle ────────────────────────▶ settled.insert(nullifier)
+                                                           lastPrint = some(clearingPrice)
+
+  anyone ──────────────────────────────────────────────▶ lastClearingPrice()  (public read)
 ```
 
 ## Layout
 
 | Path | Contents |
 |---|---|
-| `flare/src/ZyloDarkPool.sol` | Escrow, root commitment, vouchers, emergency exit |
-| `flare/test/ZyloDarkPool.t.sol` | 19 custody and adversarial tests |
-| `flare/test/ZyloDarkPoolCrossCheck.t.sol` | Go↔Solidity hashing conformance |
-| `tee/book.go` | Sealed order book and uniform-price batch auction |
-| `tee/ledger.go` | Private balances, Merkle commitment |
-| `tee/eip712.go` | Typed-data hashing and signature recovery |
-| `tee/exchange.go` | Orchestration, fail-closed withdrawals, root publication |
-| `tee/server.go` | HTTP surface, session-gated reads |
-| `tee/chain.go` | Escrow client, deposit watcher |
-
-## Cross-language conformance
-
-The enclave and the contract independently implement the same leaf encoding and
-the same EIP-712 hashing, in two languages. If they ever diverge, the emergency
-exit would reject valid proofs — and it would only be discovered at the exact
-moment users needed it.
-
-So agreement is asserted, not assumed. `go test -run CrossCheck ./...` writes a
-vector from the Go implementation; `ZyloDarkPoolCrossCheck.t.sol` recomputes it
-in Solidity and fails on any mismatch of leaf encoding, Merkle root, proof
-verification, domain separator or withdrawal digest.
+| `contracts/darkpool.compact` | The contract: `placeOrder`, `settle`, `lastClearingPrice`, the commitment/nullifier construction, and the public-vs-private comment block |
+| `managed/darkpool/` | Compiler output — TypeScript contract, ZK circuits, proving and verifying keys (`npm run compile` regenerates it) |
+| `tests/darkpool-simulator.ts` | Test harness: deploys the contract in-process, threads the circuit context, recomputes commitments off-chain |
+| `tests/darkpool.test.ts` | 12 tests — circuit logic, state transitions, privacy |
 
 ## Running it
 
 ```bash
-# contracts
-cd flare && forge test
-
-# enclave
-cd tee && go test ./...
-
-# regenerate the conformance vector after changing either side
-cd tee && go test -run CrossCheck ./... && cd ../flare && forge test --match-contract CrossCheck
+nvm use 22
+npm install
+npm run compile      # compact compile -> managed/darkpool/
+npm test             # 12 tests, in-process, no proof server needed
 ```
 
-Local run against Coston2:
+The test harness runs the generated JavaScript contract directly and does not
+generate real proofs, so it needs neither Docker nor the proof server. Those are
+required only for deploy and for real transactions:
 
 ```bash
-export SIMULATED_TEE=true          # no CVM hardware; development only
-export DARKPOOL_ADDRESS=0x...      # deployed ZyloDarkPool
-export RPC_URL=https://coston2-api.flare.network/ext/C/rpc
-export CHAIN_ID=114
-export BATCH_SECONDS=30
-cd tee && go run .
+docker run -p 6300:6300 midnightntwrk/proof-server:8.1.0 midnight-proof-server -v
 ```
-
-| Variable | Purpose | Default |
-|---|---|---|
-| `ENCLAVE_PRIVATE_KEY` | Signing identity; sealed to the CVM in production | required unless simulated |
-| `SIMULATED_TEE` | Generate an ephemeral key, skip attestation | `false` |
-| `DARKPOOL_ADDRESS` | Escrow contract | required |
-| `BATCH_SECONDS` | Auction cadence | `30` |
-| `START_BLOCK` | First block to scan for deposits | `0` |
 
 ## Markets
 
-Every tradeable address is a live deployment, resolved from the
-FlareContractRegistry and the AssetManagerController rather than hand-picked.
-Nothing here is a mock.
-
-| Market | Base | Quote |
-|---|---|---|
-| FXRP / C2FLR | `0x0b6A…3dc7` (6dp) | native |
-| FXRP / USD₮0 | `0x0b6A…3dc7` (6dp) | `0xC1A5…E71F` (6dp) |
-| C2FLR / USD₮0 | native | `0xC1A5…E71F` (6dp) |
-
-Coston2 carries exactly one FAsset, so FXRP is the only bridged asset there.
-Overriding `TOKEN_FXRP` / `TOKEN_USDT0` repoints the same markets at Flare
-mainnet, where FXRP is `0xAd552A648C74D49E10027AB8a618A3ad4901c5bE`.
-
-Market ids are derived identically on both sides — `keccak256(base ++ quote)`
-in `markets.go` and `markets.ts` — and pinned against each other by
-`tests/markets.test.ts`, because a mismatch would silently reject every order
-as an unknown market rather than failing loudly.
+There are none yet. Once settlement moves against shielded balances, a market is
+a pair of Midnight shielded tokens and the clearing price is quoted in the quote
+token.
 
 ## In the app
 
-The **Trade** tab (`/pool`) carries the whole flow: deposit, sealed order
-entry, your resting orders, and withdrawal. It reads `enclaveIsLive()` straight
-from the escrow, so if the enclave stops publishing roots the UI says so and
-points at the emergency exit rather than pretending the venue is healthy.
-
-Charts come from TradingView and show the **public market for the underlying
-asset**. The pool's own book has no public feed — that is the product — so only
-its clearing price is surfaced, and only after a batch settles.
+The frontend is built in Level 2. The intended surface is one **Trade** view
+carrying sealed order entry, your resting orders (recognised locally by
+`orderSecret()`, not by any on-chain identity), and — once custody lands —
+deposit and withdrawal. Charts, if any, show a public reference market; the
+pool's own book has no public feed by design, only its clearing price after a
+batch settles.
 
 ## Status
 
-Contracts, enclave runtime and the Trade tab are complete and tested —
-30 Forge tests, 17 Go tests, 58 frontend tests, including cross-language
-conformance in both directions. Not audited.
+**Level 1 complete.** The contract compiles (`compact` 0.34.0, language 0.26,
+ledger 9.1.0) and 12 tests pass, covering the crossing rule, malformed-order and
+phantom-order rejection, `orderCount` / `orderCommitments` / `lastPrint` /
+`settled` transitions, no-double-settle, and four privacy assertions.
 
-The escrow is not yet deployed to Coston2. Deploy it, point
-`NEXT_PUBLIC_DARK_POOL` and `DARKPOOL_ADDRESS` at the result, and the venue is
-live:
-
-```bash
-cd flare
-TEE_SIGNER=<enclave /health signer> \
-  forge script script/DeployZyloDarkPool.s.sol --rpc-url coston2 --broadcast
-```
+**Not done:** deploy to Preview / Preprod (needs a funded testnet wallet), the
+batch-auction orchestration, clearing-price honesty in-circuit, shielded-balance
+custody, and the frontend. Not audited.
